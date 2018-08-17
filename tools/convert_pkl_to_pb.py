@@ -522,9 +522,8 @@ def _prepare_blobs(
     return blobs
 
 
-def run_model_pb(args, models_pb, im, check_blobs):
+def run_model_pb(args, net, init_net, im, check_blobs):
     workspace.ResetWorkspace()
-    net, init_net = models_pb['net']
     workspace.RunNetOnce(init_net)
     mutils.create_input_blobs_for_net(net.Proto())
     workspace.CreateNet(net)
@@ -558,90 +557,38 @@ def run_model_pb(args, models_pb, im, check_blobs):
         classids = np.zeros((R,), dtype=np.float32)
 
     cls_keyps, cls_segms = None, None
+    try:
+        workspace.RunNet(keypoint_net)
+        pred_heatmaps = workspace.FetchBlob(core.ScopedName('kps_score')).squeeze()
+        # In case of 1
+        if pred_heatmaps.ndim == 3:
+            pred_heatmaps = np.expand_dims(pred_heatmaps, axis=0)
+    except Exception as e:
+        print('Running pb model failed.\n{}'.format(e))
+        R, M = 0, cfg.KRCNN.HEATMAP_SIZE
+        pred_heatmaps = np.zeros((R, cfg.KRCNN.NUM_KEYPOINTS, M, M), np.float32)
 
-    if 'keypoint_net' in models_pb:
-        keypoint_net, init_keypoint_net = models_pb['keypoint_net']
-        workspace.RunNetOnce(init_keypoint_net)
-        mutils.create_input_blobs_for_net(keypoint_net.Proto())
-        keypoint_net.Proto().external_input.extend(['rpn_rois', 'bbox_pred', 'im_info', 'cls_prob'])
-        workspace.CreateNet(keypoint_net)
+    xy_preds = keypoint_utils.heatmaps_to_keypoints(pred_heatmaps, boxes)
+    cls_keyps = [[] for _ in range(cfg.MODEL.NUM_CLASSES)]
+    cls_keyps[1] = [xy_preds[i] for i in range(xy_preds.shape[0])]
 
-        im_scale = input_blobs['im_info'][0][2]
-        input_blobs = {'keypoint_rois': test._get_rois_blob(boxes, im_scale)}
+    try:
+        # Fetch masks
+        pred_masks = workspace.FetchBlob(core.ScopedName('mask_fcn_probs')).squeeze()
+        if cfg.MRCNN.CLS_SPECIFIC_MASK:
+            pred_masks = pred_masks.reshape([-1, cfg.MODEL.NUM_CLASSES, M, M])
+        else:
+            pred_masks = pred_masks.reshape([-1, 1, M, M])
+    except Exception as e:
+        print('Running pb model failed.\n{}'.format(e))
+        R = 0
+        if cfg.MRCNN.CLS_SPECIFIC_MASK:
+            pred_masks = np.zeros((R, cfg.MODEL.NUM_CLASSES, M, M), dtype=np.float32)
+        else:
+            pred_masks = np.zeros((R, 1, M, M), dtype=np.float32)
 
-        # Add multi-level rois for FPN
-        if cfg.FPN.MULTILEVEL_ROIS:
-            test._add_multilevel_rois_for_test(input_blobs, 'keypoint_rois')
-
-        gpu_blobs = []
-        if args.device == 'gpu':
-            gpu_blobs = ['data']
-        for k, v in list(input_blobs.items()):
-            workspace.FeedBlob(
-                core.ScopedName(k),
-                v,
-                mutils.get_device_option_cuda() if k in gpu_blobs else
-                mutils.get_device_option_cpu()
-            )
-
-        try:
-            workspace.RunNet(keypoint_net)
-            pred_heatmaps = workspace.FetchBlob(core.ScopedName('kps_score')).squeeze()
-            # In case of 1
-            if pred_heatmaps.ndim == 3:
-                pred_heatmaps = np.expand_dims(pred_heatmaps, axis=0)
-        except Exception as e:
-            print('Running pb model failed.\n{}'.format(e))
-            R, M = 0, cfg.KRCNN.HEATMAP_SIZE
-            pred_heatmaps = np.zeros((R, cfg.KRCNN.NUM_KEYPOINTS, M, M), np.float32)
-
-        xy_preds = keypoint_utils.heatmaps_to_keypoints(pred_heatmaps, boxes)
-        cls_keyps = [[] for _ in range(cfg.MODEL.NUM_CLASSES)]
-        cls_keyps[1] = [xy_preds[i] for i in range(xy_preds.shape[0])]
-
-    if 'mask_net' in models_pb:
-        mask_net, init_mask_net = models_pb['mask_net']
-        workspace.RunNetOnce(init_mask_net)
-        mutils.create_input_blobs_for_net(mask_net.Proto())
-        mask_net.Proto().external_input.extend(['rpn_rois', 'bbox_pred', 'im_info', 'cls_prob'])
-        workspace.CreateNet(mask_net)
-
-        im_scale = input_blobs['im_info'][0][2]
-        input_blobs = {'mask_rois': test._get_rois_blob(boxes, im_scale)}
-
-        # Add multi-level rois for FPN
-        if cfg.FPN.MULTILEVEL_ROIS:
-            test._add_multilevel_rois_for_test(input_blobs, 'mask_rois')
-
-        gpu_blobs = []
-        if args.device == 'gpu':
-            gpu_blobs = ['data']
-        for k, v in list(input_blobs.items()):
-            workspace.FeedBlob(
-                core.ScopedName(k),
-                v,
-                mutils.get_device_option_cuda() if k in gpu_blobs else
-                mutils.get_device_option_cpu()
-            )
-        M = cfg.MRCNN.RESOLUTION
-        try:
-            workspace.RunNet(mask_net)
-            # Fetch masks
-            pred_masks = workspace.FetchBlob(core.ScopedName('mask_fcn_probs')).squeeze()
-            if cfg.MRCNN.CLS_SPECIFIC_MASK:
-                pred_masks = pred_masks.reshape([-1, cfg.MODEL.NUM_CLASSES, M, M])
-            else:
-                pred_masks = pred_masks.reshape([-1, 1, M, M])
-        except Exception as e:
-            print('Running pb model failed.\n{}'.format(e))
-            R = 0
-            if cfg.MRCNN.CLS_SPECIFIC_MASK:
-                pred_masks = np.zeros((R, cfg.MODEL.NUM_CLASSES, M, M), dtype=np.float32)
-            else:
-                pred_masks = np.zeros((R, 1, M, M), dtype=np.float32)
-
-        cls_boxes = [np.empty(list(classids).count(i)) for i in range(cfg.MODEL.NUM_CLASSES)]
-        cls_segms = test.segm_results(cls_boxes, pred_masks, boxes, im.shape[0], im.shape[1])
+    cls_boxes = [np.empty(list(classids).count(i)) for i in range(cfg.MODEL.NUM_CLASSES)]
+    cls_segms = test.segm_results(cls_boxes, pred_masks, boxes, im.shape[0], im.shape[1])
 
     boxes = np.column_stack((boxes, scores))
 
@@ -669,7 +616,7 @@ def run_model_pb(args, models_pb, im, check_blobs):
     return ret
 
 
-def verify_model(args, models_pb, test_img_file):
+def verify_model(args, net, init_net, test_img_file):
     check_blobs = ['result_boxes', 'result_classids']
 
     if cfg.MODEL.MASK_ON:
@@ -686,14 +633,14 @@ def verify_model(args, models_pb, test_img_file):
         return run_model_cfg(args, im, check_blobs)
 
     def _run_pb_func(im, blobs):
-        return run_model_pb(args, models_pb, im, check_blobs)
+        return run_model_pb(args, net, init_net, im, check_blobs)
 
     print('Checking models...')
     assert mutils.compare_model(
         _run_cfg_func, _run_pb_func, test_img, check_blobs)
 
 
-def convert_to_pb(args, net, blobs, part_name='net', input_blobs=[]):
+def convert_to_pb(args, net, blobs, input_blobs):
     pb_net = core.Net('')
     pb_net.Proto().op.extend(copy.deepcopy(net.op))
 
@@ -723,8 +670,8 @@ def convert_to_pb(args, net, blobs, part_name='net', input_blobs=[]):
     if args.device == 'gpu':
         [pb_net, pb_init_net] = convert_model_gpu(args, pb_net, pb_init_net)
 
-    pb_net.Proto().name = args.net_name + '_' + part_name
-    pb_init_net.Proto().name = args.net_name + '_' + part_name + '_init'
+    pb_net.Proto().name = args.net_name + '_net'
+    pb_init_net.Proto().name = args.net_name + '_net_init'
 
     return pb_net, pb_init_net
 
@@ -743,25 +690,27 @@ def main():
     logger.info('Converting model with config:')
     logger.info(pprint.pformat(cfg))
 
-    models_pb = {}
-
     # load model from cfg
     model, blobs = load_model(args)
 
     input_net = ['data', 'im_info']
-    models_pb['net'] = convert_to_pb(args, model.net.Proto(), blobs, input_blobs=input_net)
 
+    # TODO: manage correctly the names during the merge
+ 
     if cfg.MODEL.MASK_ON:
-        models_pb['mask_net'] = convert_to_pb(args, model.mask_net.Proto(), blobs, part_name='mask_net')
+        model.net.Proto().op.extend(model.mask_net.Proto().op)
+        model.net.Proto().external_output.extend(model.mask_net.Proto().external_output)
 
     if cfg.MODEL.KEYPOINTS_ON:
-        models_pb['keypoint_net'] = convert_to_pb(args, model.keypoint_net.Proto(), blobs, part_name='keypoint_net')
+        model.net.Proto().op.extend(model.keypoint_net.Proto().op)
+        model.net.Proto().external_output.extend(model.keypoint_net.Proto().external_output)
 
-    for (pb_net, pb_init_net) in models_pb.values():
-        _save_models(pb_net, pb_init_net, args)
+    net, init_net = convert_to_pb(args, model.net.Proto(), blobs, input_net)
+
+    _save_models(net, init_net, args)
 
     if args.test_img is not None:
-        verify_model(args, models_pb, args.test_img)
+        verify_model(args, net, init_net, args.test_img)
 
 if __name__ == '__main__':
     main()
