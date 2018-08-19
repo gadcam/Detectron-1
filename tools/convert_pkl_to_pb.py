@@ -338,8 +338,8 @@ def add_bbox_ops(args, net, blobs):
     new_ops.extend([op_nms])
     new_external_outputs.extend(['score_nms', 'bbox_nms', 'class_nms'])
 
-    net.Proto().op.extend(new_ops)
-    net.Proto().external_output.extend(new_external_outputs)
+    net.op.extend(new_ops)
+    net.external_output.extend(new_external_outputs)
 
 
 def convert_model_gpu(args, net, init_net):
@@ -483,10 +483,10 @@ def run_model_cfg(args, im, check_blobs):
     with c2_utils.NamedCudaScope(0):
         ret = _get_result_blobs(check_blobs)
 
-    print('result_boxes', _ornone(boxes))
-    print('result_segms', _ornone(segms))
-    print('result_keypoints', _ornone(keypoints))
-    print('result_classids', _ornone(classids))
+    logger.info(('result_boxes', _ornone(boxes))
+    logger.info(('result_segms', _ornone(segms))
+    logger.info(('result_keypoints', _ornone(keypoints))
+    logger.info(('result_classids', _ornone(classids))
     return ret
 
 
@@ -550,45 +550,37 @@ def run_model_pb(args, net, init_net, im, check_blobs):
         classids = workspace.FetchBlob(core.ScopedName('class_nms'))
         boxes = workspace.FetchBlob(core.ScopedName('bbox_nms'))
     except Exception as e:
-        print('Running pb model failed.\n{}'.format(e))
+        logger.warn('Running pb model failed.\n{}'.format(e))
         R = 0
         scores = np.zeros((R,), dtype=np.float32)
         boxes = np.zeros((R, 4), dtype=np.float32)
         classids = np.zeros((R,), dtype=np.float32)
 
-    cls_keyps, cls_segms = None, None
-    try:
-        workspace.RunNet(keypoint_net)
+    cls_segms, cls_keyps = None, None
+
+    if net.BlobIsDefined(core.ScopedName('kps_score')):
         pred_heatmaps = workspace.FetchBlob(core.ScopedName('kps_score')).squeeze()
         # In case of 1
         if pred_heatmaps.ndim == 3:
             pred_heatmaps = np.expand_dims(pred_heatmaps, axis=0)
-    except Exception as e:
-        print('Running pb model failed.\n{}'.format(e))
-        R, M = 0, cfg.KRCNN.HEATMAP_SIZE
-        pred_heatmaps = np.zeros((R, cfg.KRCNN.NUM_KEYPOINTS, M, M), np.float32)
+        xy_preds = keypoint_utils.heatmaps_to_keypoints(pred_heatmaps, boxes)
+        cls_keyps = [[] for _ in range(cfg.MODEL.NUM_CLASSES)]
+        cls_keyps[1] = [xy_preds[i] for i in range(xy_preds.shape[0])]
+    else:
+        logger.info('Keypoint blob is not defined')
 
-    xy_preds = keypoint_utils.heatmaps_to_keypoints(pred_heatmaps, boxes)
-    cls_keyps = [[] for _ in range(cfg.MODEL.NUM_CLASSES)]
-    cls_keyps[1] = [xy_preds[i] for i in range(xy_preds.shape[0])]
-
-    try:
+    if net.BlobIsDefined(core.ScopedName('mask_fcn_probs')):
         # Fetch masks
         pred_masks = workspace.FetchBlob(core.ScopedName('mask_fcn_probs')).squeeze()
+        M = cfg.MRCNN.RESOLUTION
         if cfg.MRCNN.CLS_SPECIFIC_MASK:
             pred_masks = pred_masks.reshape([-1, cfg.MODEL.NUM_CLASSES, M, M])
         else:
             pred_masks = pred_masks.reshape([-1, 1, M, M])
-    except Exception as e:
-        print('Running pb model failed.\n{}'.format(e))
-        R = 0
-        if cfg.MRCNN.CLS_SPECIFIC_MASK:
-            pred_masks = np.zeros((R, cfg.MODEL.NUM_CLASSES, M, M), dtype=np.float32)
-        else:
-            pred_masks = np.zeros((R, 1, M, M), dtype=np.float32)
-
-    cls_boxes = [np.empty(list(classids).count(i)) for i in range(cfg.MODEL.NUM_CLASSES)]
-    cls_segms = test.segm_results(cls_boxes, pred_masks, boxes, im.shape[0], im.shape[1])
+        cls_boxes = [np.empty(list(classids).count(i)) for i in range(cfg.MODEL.NUM_CLASSES)]
+        cls_segms = test.segm_results(cls_boxes, pred_masks, boxes, im.shape[0], im.shape[1])
+    else:
+        logger.info('Mask blob is not defined')
 
     boxes = np.column_stack((boxes, scores))
 
@@ -609,10 +601,10 @@ def run_model_pb(args, net, init_net, im, check_blobs):
 
     ret = _get_result_blobs(check_blobs)
 
-    print('result_boxes', _ornone(boxes))
-    print('result_segms', _ornone(segms))
-    print('result_keypoints', _ornone(keypoints))
-    print('result_classids', _ornone(classids))
+    logger.info(('result_boxes', _ornone(boxes))
+    logger.info(('result_segms', _ornone(segms))
+    logger.info(('result_keypoints', _ornone(keypoints))
+    logger.info(('result_classids', _ornone(classids))
     return ret
 
 
@@ -655,7 +647,7 @@ def convert_to_pb(args, net, blobs, input_blobs):
     convert_net(args, pb_net.Proto(), blobs)
 
     # add operators for bbox
-    add_bbox_ops(args, pb_net, blobs)
+    add_bbox_ops(args, pb_net.Proto(), blobs)
 
     if args.fuse_af:
         print('Fusing affine channel...')
@@ -695,15 +687,43 @@ def main():
 
     input_net = ['data', 'im_info']
 
-    # TODO: manage correctly the names during the merge
- 
-    if cfg.MODEL.MASK_ON:
-        model.net.Proto().op.extend(model.mask_net.Proto().op)
-        model.net.Proto().external_output.extend(model.mask_net.Proto().external_output)
-
     if cfg.MODEL.KEYPOINTS_ON:
-        model.net.Proto().op.extend(model.keypoint_net.Proto().op)
-        model.net.Proto().external_output.extend(model.keypoint_net.Proto().external_output)
+        model_kps = model.keypoint_net.Proto()
+
+        # Connect rois blobs
+        for op in model_kps.op:
+            for i, input_name in enumerate(op.input):
+                op.input[i] = input_name.replace("keypoint_rois", "rois")
+
+        # Remove external input defined in main net
+        kps_external_input = []
+        for i in model_kps.external_input:
+            if not model.net.BlobIsDefined(i) and \
+               not "keypoint_rois" in i:
+                kps_external_input.append(i)
+
+        model.net.Proto().op.extend(model_kps.op)
+        model.net.Proto().external_output.extend(model_kps.external_output)
+        model.net.Proto().external_input.extend(kps_external_input)
+
+    if cfg.MODEL.MASK_ON:
+        model_mask = model.mask_net.Proto()
+
+        # Connect rois blobs
+        for op in model_mask.op:
+            for i, input_name in enumerate(op.input):
+                op.input[i] = input_name.replace("mask_rois", "rois")
+
+        # Remove external input defined in main net
+        mask_external_input = []
+        for i in model_mask.external_input:
+            if not model.net.BlobIsDefined(i) and \
+               not "mask_rois" in i:
+                mask_external_input.append(i)
+
+        model.net.Proto().op.extend(model_mask.op)
+        model.net.Proto().external_output.extend(model_mask.external_output)
+        model.net.Proto().external_input.extend(mask_external_input)
 
     net, init_net = convert_to_pb(args, model.net.Proto(), blobs, input_net)
 
